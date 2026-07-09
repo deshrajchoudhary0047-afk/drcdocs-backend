@@ -7,7 +7,7 @@ import pytest
 import requests
 from pathlib import Path
 
-BASE_URL = "https://logistics-ocr-pro-1.preview.emergentagent.com"
+BASE_URL = "https://drcdocs-backend.onrender.com"
 
 # Small real JPEG image (invoice-style with text) - we generate one with PIL
 def _build_test_jpeg_b64():

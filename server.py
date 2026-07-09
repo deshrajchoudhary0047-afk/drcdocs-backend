@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
 import os
 import io
 import json
@@ -19,14 +20,17 @@ from datetime import datetime, timezone
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-MONGO_URL = os.environ["MONGO_URL"]
-DB_NAME = os.environ["DB_NAME"]
+MONGO_URL = os.environ.get("MONGO_URL", "")
+DB_NAME = os.environ.get("DB_NAME", "svl_docs")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+if not MONGO_URL:
+    raise RuntimeError("MONGO_URL is not configured in backend/.env")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-app = FastAPI(title="DRCDocs Enterprise API")
+app = FastAPI(title="SVL Docs Scanner API", version="2.0.0")
 api = APIRouter(prefix="/api")
 
 
@@ -36,6 +40,18 @@ api = APIRouter(prefix="/api")
 class OCRRequest(BaseModel):
     image_base64: str
     mime_type: str = "image/jpeg"
+
+    # V2.0 options used by frontend
+    pdf_mode: bool = False
+    detect_only_eway: bool = True
+    auto_crop: bool = True
+    ai_enhance: bool = True
+
+
+class PDFOCRRequest(BaseModel):
+    pdf_base64: str
+    file_name: str = "document.pdf"
+    detect_only_eway: bool = True
 
 
 class OCRField(BaseModel):
@@ -49,10 +65,13 @@ class OCRResult(BaseModel):
     raw_text: str = ""
     fields: Dict[str, OCRField] = {}
     overall_confidence: float = 0.0
+    page_count: int = 0
+    detected_pages: int = 0
+    pages: List[Dict[str, Any]] = []
 
 
 class RecordCreate(BaseModel):
-    # === CORE 10 FIELDS (per spec) ===
+    # === CORE FIELDS ===
     date: str = ""
     lr_number: str = ""
     vehicle_number: str = ""
@@ -63,10 +82,26 @@ class RecordCreate(BaseModel):
     recipient_name: str = ""
     delivery_place: str = ""
     amount: str = ""
-    # === Legacy / retained (populated only if present) ===
+
+    # === V2.0 E-Way / PDF fields ===
+    eway_bill_no: str = ""
+    transporter: str = ""
+    source_type: str = "image"
+    mime_type: str = "image/jpeg"
+    file_name: str = ""
+    page_count: int = 0
+    detected_pages: int = 0
+    selected_page: int = 0
+    pages: List[Dict[str, Any]] = []
+
+    # Recently Deleted
+    is_deleted: bool = False
+    deleted_at: str = ""
+
+    # === Legacy / retained ===
     document_type: str = "lr_receipt"
-    document_number: str = ""  # legacy; mirror of lr_number
-    gstin: str = ""            # legacy
+    document_number: str = ""
+    gstin: str = ""
     transporter_name: str = ""
     consignor: str = ""
     consignee: str = ""
@@ -98,13 +133,20 @@ class RecordCreate(BaseModel):
 
 class Record(RecordCreate):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    serial_no: int = 0  # auto-incremented on insert
+    serial_no: int = 0
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    year: int = 0
+    month: int = 0
+    week: int = 0
+    ocr_version: str = "SVL AI Engine 2.0"
+    ocr_confidence: float = 0.0
+    processed_at: str = ""
+    status: str = "verified"
+    review_required: bool = False
 
 
 class RecordUpdate(BaseModel):
-    # Core
     date: Optional[str] = None
     lr_number: Optional[str] = None
     vehicle_number: Optional[str] = None
@@ -115,7 +157,19 @@ class RecordUpdate(BaseModel):
     recipient_name: Optional[str] = None
     delivery_place: Optional[str] = None
     amount: Optional[str] = None
-    # Legacy / retained
+
+    eway_bill_no: Optional[str] = None
+    transporter: Optional[str] = None
+    source_type: Optional[str] = None
+    mime_type: Optional[str] = None
+    file_name: Optional[str] = None
+    page_count: Optional[int] = None
+    detected_pages: Optional[int] = None
+    selected_page: Optional[int] = None
+    pages: Optional[List[Dict[str, Any]]] = None
+    is_deleted: Optional[bool] = None
+    deleted_at: Optional[str] = None
+
     document_type: Optional[str] = None
     document_number: Optional[str] = None
     gstin: Optional[str] = None
@@ -140,6 +194,7 @@ class RecordUpdate(BaseModel):
     is_favorite: Optional[bool] = None
     raw_text: Optional[str] = None
     image_base64: Optional[str] = None
+    original_image_base64: Optional[str] = None
     processed_image_base64: Optional[str] = None
     pdf_base64: Optional[str] = None
     image_hash: Optional[str] = None
@@ -160,37 +215,41 @@ class Folder(FolderCreate):
 
 class ExportRequest(BaseModel):
     record_ids: Optional[List[str]] = None
-    format: str = "csv"  # csv, json, txt, xlsx, pdf
-    # Scope filters (all optional). If none provided and record_ids empty, exports ALL.
+    format: str = "csv"
     folder_id: Optional[str] = None
-    scope: Optional[str] = None  # today | week | month | year | all
+    scope: Optional[str] = None
     year: Optional[int] = None
-    month: Optional[int] = None   # 1-12
-    week: Optional[int] = None    # ISO week number (used with year)
+    month: Optional[int] = None
+    week: Optional[int] = None
+    document_type: Optional[str] = None
 
 
 class DuplicateRequest(BaseModel):
     lr_number: Optional[str] = ""
+    document_number: Optional[str] = ""
+    eway_bill_no: Optional[str] = ""
     vehicle_number: Optional[str] = ""
     supplier_gstin: Optional[str] = ""
     recipient_gstin: Optional[str] = ""
+    gstin: Optional[str] = ""
     amount: Optional[str] = ""
     date: Optional[str] = ""
     image_hash: Optional[str] = ""
-    exclude_id: Optional[str] = None  # ignore this record (used when editing)
+    exclude_id: Optional[str] = None
 
 
 # =========================
-# OCR via Emergent LLM
+# OCR
 # =========================
-SYSTEM_PROMPT = """You are an expert OCR + extraction engine for Indian transport & logistics documents (LR/bilty, e-way bills, GST tax invoices, delivery challans).
+SYSTEM_PROMPT = """You are an expert OCR + extraction engine for Indian transport & logistics documents, especially E-Way Bills.
 
 Return ONLY valid JSON. No prose, no markdown fences.
 Schema:
 {
- "document_type": "lr_receipt|bilty|eway_bill|gst_invoice|delivery_challan|invoice|unknown",
+ "document_type": "eway_bill|lr_receipt|bilty|gst_invoice|delivery_challan|invoice|unknown",
  "raw_text": "full raw OCR text",
  "fields": {
+   "eway_bill_no": {"value": "", "confidence": 0.0},
    "date": {"value": "", "confidence": 0.0},
    "lr_number": {"value": "", "confidence": 0.0},
    "vehicle_number": {"value": "", "confidence": 0.0},
@@ -200,26 +259,74 @@ Schema:
    "recipient_gstin": {"value": "", "confidence": 0.0},
    "recipient_name": {"value": "", "confidence": 0.0},
    "delivery_place": {"value": "", "confidence": 0.0},
-   "amount": {"value": "", "confidence": 0.0}
+   "amount": {"value": "", "confidence": 0.0},
+   "transporter": {"value": "", "confidence": 0.0}
  },
  "overall_confidence": 0.0
 }
 
-Field mapping guide:
-- lr_number: Lorry Receipt No / LR No / Consignment Note No / GC No / Bilty No / Invoice No (whichever is the primary document reference).
-- supplier / consignor / sender / from party -> supplier_name & supplier_gstin.
-- recipient / consignee / buyer / to party -> recipient_name & recipient_gstin.
-- dispatch_place: origin city / from / dispatched from (city name).
-- delivery_place: destination city / to / delivery at (city name).
-- date: document date in the format printed on the document (dd/mm/yyyy or dd-mm-yyyy).
-- amount: total amount / grand total as a plain number string (no currency symbol, no commas).
-- Confidence 0.0-1.0. If a field is absent leave value:"" and confidence:0.0. Never invent values.
-- GSTIN is a 15-character alphanumeric code (e.g., 27AAAAA0000A1Z5). Return only if clearly visible.
+Strict rules:
+- If document is not readable, return document_type:"unknown".
+- Never guess GSTIN. Never guess vehicle number. Never invent values.
+- Leave field empty if not clearly found.
+- GSTIN is 15-character alphanumeric.
+- amount/value should be plain number string without currency symbols or commas.
+- For E-Way Bill, eway_bill_no may be printed as E-Way Bill No, EWB No, EWB.
+- date should be printed date, usually dd/mm/yyyy or dd-mm-yyyy.
 """
 
 
+PDF_PROMPT = """You are an OCR engine for multi-page Indian transport PDFs.
+
+Read ALL pages.
+Detect only pages that are clearly E-Way Bills.
+Ignore unrelated invoices, bilty pages, transport receipts, and blank pages when detect_only_eway is true.
+
+Return ONLY valid JSON:
+{
+ "document_type": "eway_bill",
+ "raw_text": "combined raw OCR text",
+ "page_count": 0,
+ "detected_pages": 0,
+ "pages": [
+   {
+     "page": 1,
+     "is_eway_bill": true,
+     "confidence": 0.0,
+     "fields": {
+       "eway_bill_no": {"value": "", "confidence": 0.0},
+       "date": {"value": "", "confidence": 0.0},
+       "lr_number": {"value": "", "confidence": 0.0},
+       "vehicle_number": {"value": "", "confidence": 0.0},
+       "supplier_gstin": {"value": "", "confidence": 0.0},
+       "supplier_name": {"value": "", "confidence": 0.0},
+       "dispatch_place": {"value": "", "confidence": 0.0},
+       "recipient_gstin": {"value": "", "confidence": 0.0},
+       "recipient_name": {"value": "", "confidence": 0.0},
+       "delivery_place": {"value": "", "confidence": 0.0},
+       "amount": {"value": "", "confidence": 0.0},
+       "transporter": {"value": "", "confidence": 0.0}
+     }
+   }
+ ],
+ "fields": {},
+ "overall_confidence": 0.0
+}
+
+Do not invent missing values.
+"""
+
+
+DEFAULT_FIELD_KEYS = [
+    "eway_bill_no", "date", "lr_number", "vehicle_number",
+    "supplier_gstin", "supplier_name", "dispatch_place",
+    "recipient_gstin", "recipient_name", "delivery_place",
+    "amount", "transporter",
+]
+
+
 def _extract_json(s: str) -> Dict[str, Any]:
-    s = s.strip()
+    s = (s or "").strip()
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?", "", s).strip()
         if s.endswith("```"):
@@ -232,6 +339,50 @@ def _extract_json(s: str) -> Dict[str, Any]:
             return json.loads(m.group(0))
         raise
 
+
+def _normalize_fields(fields: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(fields, dict):
+        fields = {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for key in DEFAULT_FIELD_KEYS:
+        v = fields.get(key, {})
+        if not isinstance(v, dict):
+            v = {"value": str(v or ""), "confidence": 0.0}
+
+        try:
+            conf = float(v.get("confidence", 0.0) or 0.0)
+        except Exception:
+            conf = 0.0
+
+        out[key] = {
+            "value": str(v.get("value", "") or ""),
+            "confidence": max(0.0, min(1.0, conf)),
+        }
+
+    # fallbacks
+    if not out["eway_bill_no"]["value"] and fields.get("document_number"):
+        dn = fields.get("document_number")
+        if isinstance(dn, dict):
+            out["eway_bill_no"] = {"value": str(dn.get("value", "") or ""), "confidence": float(dn.get("confidence", 0.0) or 0.0)}
+    return out
+
+
+def calculate_confidence(fields: Dict[str, Any]) -> float:
+    if not fields:
+        return 0.0
+    scores = []
+    for value in fields.values():
+        if isinstance(value, dict) and value.get("value"):
+            try:
+                scores.append(float(value.get("confidence", 0.0) or 0.0))
+            except Exception:
+                pass
+    if not scores:
+        return 0.0
+    return round(sum(scores) / len(scores), 4)
+
+
 async def run_ocr(image_b64: str, mime_type: str) -> Dict[str, Any]:
     if not GEMINI_API_KEY:
         raise HTTPException(500, "Gemini API key not configured")
@@ -239,296 +390,75 @@ async def run_ocr(image_b64: str, mime_type: str) -> Dict[str, Any]:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-2.5-flash")
 
-    prompt = SYSTEM_PROMPT
-
     try:
-        image_bytes = base64.b64decode(image_b64)
+        file_bytes = base64.b64decode(image_b64)
+        prompt = PDF_PROMPT if mime_type == "application/pdf" else SYSTEM_PROMPT
 
         response = model.generate_content(
-    [
-        prompt,
-        {
-            "mime_type": mime_type,
-            "data": image_bytes,
-        },
-    ],
-    generation_config={
-        "temperature": 0
-    }
-)
+            [
+                prompt,
+                {"mime_type": mime_type, "data": file_bytes},
+            ],
+            generation_config={"temperature": 0},
+        )
+
         data = _extract_json(response.text or "{}")
 
-        default_fields = [
-            "date", "lr_number", "vehicle_number",
-            "supplier_gstin", "supplier_name", "dispatch_place",
-            "recipient_gstin", "recipient_name", "delivery_place",
-            "amount",
-        ]
+        if mime_type == "application/pdf":
+            pages = data.get("pages", []) if isinstance(data.get("pages", []), list) else []
+            normalized_pages = []
+            for idx, p in enumerate(pages, start=1):
+                p = p if isinstance(p, dict) else {}
+                normalized_pages.append({
+                    "page": int(p.get("page") or idx),
+                    "is_eway_bill": bool(p.get("is_eway_bill", True)),
+                    "confidence": float(p.get("confidence", 0.0) or 0.0),
+                    "fields": _normalize_fields(p.get("fields", {})),
+                })
+            first_fields = normalized_pages[0]["fields"] if normalized_pages else _normalize_fields({})
+            return {
+                "document_type": "eway_bill" if normalized_pages else "unknown",
+                "raw_text": str(data.get("raw_text", "") or ""),
+                "fields": first_fields,
+                "overall_confidence": calculate_confidence(first_fields),
+                "page_count": int(data.get("page_count") or len(normalized_pages)),
+                "detected_pages": int(data.get("detected_pages") or len(normalized_pages)),
+                "pages": normalized_pages,
+            }
 
-        fields = data.get("fields", {}) or {}
-
-        for f in default_fields:
-            if f not in fields or not isinstance(fields[f], dict):
-                fields[f] = {"value": "", "confidence": 0.0}
-
-            fields[f]["value"] = str(fields[f].get("value", "") or "")
-            fields[f]["confidence"] = float(fields[f].get("confidence", 0.0) or 0.0)
-
+        fields = _normalize_fields(data.get("fields", {}))
         return {
-            "document_type": data.get("document_type", "lr_receipt"),
-            "raw_text": data.get("raw_text", ""),
+            "document_type": str(data.get("document_type", "unknown") or "unknown"),
+            "raw_text": str(data.get("raw_text", "") or ""),
             "fields": fields,
-            "overall_confidence": float(data.get("overall_confidence", 0.0) or 0.0)
+            "overall_confidence": float(data.get("overall_confidence", calculate_confidence(fields)) or 0.0),
         }
-
-    except Exception as e:
-        logging.exception("Gemini OCR failed")
-        raise HTTPException(500, f"OCR failed: {e}")
-
-
-# =========================
-# Routes
-# =========================
-@api.get("/")
-async def root():
-    return {"message": "DRCDocs Enterprise API", "version": "1.0.0"}
-
-
-@api.get("/stats")
-async def stats():
-    total = await db.records.count_documents({})
-    favorites = await db.records.count_documents({"is_favorite": True})
-    folders = await db.folders.count_documents({})
-    recent = await db.records.find({}, {"_id": 0}).sort("created_at", -1).limit(5).to_list(5)
-    # count by type
-    pipeline = [{"$group": {"_id": "$document_type", "count": {"$sum": 1}}}]
-    by_type_cursor = db.records.aggregate(pipeline)
-    by_type = {}
-    async for row in by_type_cursor:
-        by_type[row["_id"] or "unknown"] = row["count"]
-    return {
-        "total_records": total,
-        "favorites": favorites,
-        "folders": folders,
-        "by_type": by_type,
-        "recent": recent,
-    }
-
-
-@api.post("/ocr/scan")
-async def ocr_scan(req: OCRRequest):
-    if not GEMINI_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Gemini API key not configured"
-        )
-
-    if not req.image_base64:
-        raise HTTPException(
-            status_code=400,
-            detail="image_base64 required"
-        )
-
-    try:
-        result = await run_ocr(
-            req.image_base64,
-            req.mime_type
-        )
-
-        return JSONResponse(
-            status_code=200,
-            content=result
-        )
 
     except HTTPException:
         raise
-
     except Exception as e:
-        logging.exception("OCR Scan Error")
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-
-@api.post("/records", response_model=Record)
-async def create_record(payload: RecordCreate):
-    rec = Record(**payload.dict())
-    # Mirror lr_number into legacy document_number for older exports
-    if rec.lr_number and not rec.document_number:
-        rec.document_number = rec.lr_number
-    # Auto Sr No — atomic counter (safe under concurrent inserts)
-    counter = await db.counters.find_one_and_update(
-        {"_id": "records_serial"},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=True,
-    )
-    # Ensure counter is at least (max existing serial_no + 1) to survive backfills
-    if not counter or counter.get("seq", 0) <= 0:
-        last = await db.records.find_one({}, {"_id": 0, "serial_no": 1}, sort=[("serial_no", -1)])
-        base = int((last or {}).get("serial_no") or 0)
-        counter = await db.counters.find_one_and_update(
-            {"_id": "records_serial"},
-            {"$set": {"seq": base + 1}},
-            upsert=True,
-            return_document=True,
-        )
-    rec.serial_no = int(counter["seq"])
-    # Guard: if seq has drifted below current max (e.g. counter was freshly created), bump it
-    existing_max = await db.records.find_one({}, {"_id": 0, "serial_no": 1}, sort=[("serial_no", -1)])
-    exmax = int((existing_max or {}).get("serial_no") or 0)
-    if rec.serial_no <= exmax:
-        counter = await db.counters.find_one_and_update(
-            {"_id": "records_serial"},
-            {"$set": {"seq": exmax + 1}},
-            return_document=True,
-        )
-        rec.serial_no = int(counter["seq"])
-    doc = rec.dict()
-    await db.records.insert_one(doc)
-    doc.pop("_id", None)
-    return rec
-
-
-@api.get("/records")
-async def list_records(
-    q: Optional[str] = None,
-    folder_id: Optional[str] = None,
-    favorites: Optional[bool] = None,
-    document_type: Optional[str] = None,
-    scope: Optional[str] = None,
-    year: Optional[int] = None,
-    month: Optional[int] = None,
-    week: Optional[int] = None,
-    limit: int = 200,
-):
-    query: Dict[str, Any] = {}
-    if folder_id:
-        query["folder_id"] = folder_id
-    if favorites:
-        query["is_favorite"] = True
-    if document_type:
-        query["document_type"] = document_type
-    scope_q = _scope_query(scope, year, month, week)
-    query.update(scope_q)
-    if q:
-        rx = {"$regex": re.escape(q), "$options": "i"}
-        query["$or"] = [
-            # Core 10
-            {"lr_number": rx}, {"vehicle_number": rx},
-            {"supplier_gstin": rx}, {"supplier_name": rx}, {"dispatch_place": rx},
-            {"recipient_gstin": rx}, {"recipient_name": rx}, {"delivery_place": rx},
-            {"amount": rx}, {"date": rx},
-            # Legacy fallback
-            {"document_number": rx}, {"gstin": rx}, {"transporter_name": rx},
-            {"consignor": rx}, {"consignee": rx},
-            {"source": rx}, {"destination": rx}, {"remarks": rx}, {"raw_text": rx},
-        ]
-    cursor = db.records.find(
-        query,
-        {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
-    ).sort("created_at", -1).limit(limit)
-    items = await cursor.to_list(limit)
-    return {"items": items, "count": len(items)}
-
-
-@api.get("/records/{record_id}")
-async def get_record(record_id: str):
-    rec = await db.records.find_one({"id": record_id}, {"_id": 0})
-    if not rec:
-        raise HTTPException(404, "Record not found")
-    return rec
-
-
-@api.patch("/records/{record_id}")
-async def update_record(record_id: str, patch: RecordUpdate):
-    updates = {k: v for k, v in patch.dict().items() if v is not None}
-    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-    res = await db.records.update_one({"id": record_id}, {"$set": updates})
-    if res.matched_count == 0:
-        raise HTTPException(404, "Record not found")
-    rec = await db.records.find_one({"id": record_id}, {"_id": 0})
-    return rec
-
-
-@api.delete("/records/{record_id}")
-async def delete_record(record_id: str):
-    res = await db.records.delete_one({"id": record_id})
-    if res.deleted_count == 0:
-        raise HTTPException(404, "Record not found")
-    return {"ok": True}
-
-
-@api.post("/records/duplicates")
-async def check_duplicates(payload: DuplicateRequest):
-    ors: List[Dict[str, Any]] = []
-    lr = (payload.lr_number or "").strip()
-    if lr:
-        # Match by lr_number or legacy document_number
-        ors.append({"lr_number": lr})
-        ors.append({"document_number": lr})
-    for key in ("vehicle_number", "supplier_gstin", "recipient_gstin", "image_hash"):
-        val = (getattr(payload, key) or "").strip()
-        if val:
-            ors.append({key: val})
-    amt = (payload.amount or "").strip()
-    dt = (payload.date or "").strip()
-    if amt and dt:
-        ors.append({"$and": [{"amount": amt}, {"date": dt}]})
-    if not ors:
-        return {"duplicates": []}
-    q: Dict[str, Any] = {"$or": ors}
-    if payload.exclude_id:
-        q["id"] = {"$ne": payload.exclude_id}
-    dups = await db.records.find(
-        q,
-        {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
-    ).limit(20).to_list(20)
-    return {"duplicates": dups}
-
-
-@api.post("/records/{record_id}/move")
-async def move_record(record_id: str, payload: Dict[str, Any]):
-    folder_id = payload.get("folder_id")  # can be None to unassign
-    res = await db.records.update_one(
-        {"id": record_id},
-        {"$set": {"folder_id": folder_id, "updated_at": datetime.now(timezone.utc).isoformat()}},
-    )
-    if res.matched_count == 0:
-        raise HTTPException(404, "Record not found")
-    return {"ok": True, "folder_id": folder_id}
-
-
-# ----- Folders -----
-@api.post("/folders", response_model=Folder)
-async def create_folder(payload: FolderCreate):
-    folder = Folder(**payload.dict())
-    await db.folders.insert_one(folder.dict())
-    return folder
-
-
-@api.get("/folders")
-async def list_folders():
-    folders = await db.folders.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
-    for f in folders:
-        f["record_count"] = await db.records.count_documents({"folder_id": f["id"]})
-    return {"items": folders}
+        logging.exception("Gemini OCR failed")
+        raise HTTPException(500, f"OCR failed: {e}")
 
 
 def _iso_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
 def _scope_query(scope: Optional[str], year: Optional[int], month: Optional[int], week: Optional[int]) -> Dict[str, Any]:
-    """Build a Mongo query for a smart date scope on `created_at` (ISO string)."""
     now = _iso_now()
     if scope == "today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         return {"created_at": {"$gte": start}}
     if scope == "week":
-        # Rolling 7 days
         from datetime import timedelta
         start = (now - timedelta(days=7)).isoformat()
         return {"created_at": {"$gte": start}}
@@ -539,7 +469,6 @@ def _scope_query(scope: Optional[str], year: Optional[int], month: Optional[int]
         start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
         return {"created_at": {"$gte": start}}
     if year and week:
-        # ISO week filtering via python date arithmetic
         from datetime import date, timedelta
         try:
             monday = date.fromisocalendar(year, week, 1)
@@ -561,19 +490,355 @@ def _scope_query(scope: Optional[str], year: Optional[int], month: Optional[int]
     return {}
 
 
+# =========================
+# Routes
+# =========================
+@api.get("/")
+async def root():
+    return {"message": "SVL Docs Scanner API", "version": "2.0.0"}
+
+
+@api.get("/stats")
+async def stats():
+    active_q = {"is_deleted": {"$ne": True}}
+    total = await db.records.count_documents(active_q)
+    favorites = await db.records.count_documents({**active_q, "is_favorite": True})
+    folders = await db.folders.count_documents({})
+    pdf_records = await db.records.count_documents({**active_q, "source_type": "pdf"})
+    image_records = await db.records.count_documents({**active_q, "source_type": {"$ne": "pdf"}})
+    trash_records = await db.records.count_documents({"is_deleted": True})
+
+    recent = await db.records.find(
+        active_q,
+        {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
+    ).sort("created_at", -1).limit(5).to_list(5)
+
+    pipeline = [
+        {"$match": active_q},
+        {"$group": {"_id": "$document_type", "count": {"$sum": 1}}},
+    ]
+    by_type_cursor = db.records.aggregate(pipeline)
+    by_type = {}
+    async for row in by_type_cursor:
+        by_type[row["_id"] or "unknown"] = row["count"]
+
+    return {
+        "total_records": total,
+        "favorites": favorites,
+        "folders": folders,
+        "pdf_records": pdf_records,
+        "image_records": image_records,
+        "trash_records": trash_records,
+        "by_type": by_type,
+        "recent": recent,
+    }
+
+
+@api.post("/ocr/scan")
+async def ocr_scan(req: OCRRequest):
+    if not req.image_base64:
+        raise HTTPException(status_code=400, detail="image_base64 required")
+    result = await run_ocr(req.image_base64, req.mime_type)
+    return JSONResponse(status_code=200, content=result)
+
+
+@api.post("/ocr/pdf")
+async def scan_pdf(req: PDFOCRRequest):
+    if not req.pdf_base64:
+        raise HTTPException(status_code=400, detail="pdf_base64 required")
+    result = await run_ocr(req.pdf_base64, "application/pdf")
+    result["file_name"] = req.file_name
+    return JSONResponse(status_code=200, content=result)
+
+
+@api.post("/records", response_model=Record)
+async def create_record(payload: RecordCreate):
+    payload_data = _model_dump(payload)
+    rec = Record(**payload_data)
+
+    # Backward/forward field mirroring
+    if rec.eway_bill_no and not rec.document_number:
+        rec.document_number = rec.eway_bill_no
+    if rec.lr_number and not rec.document_number:
+        rec.document_number = rec.lr_number
+    if rec.supplier_gstin and not rec.gstin:
+        rec.gstin = rec.supplier_gstin
+    if rec.supplier_name and not rec.consignor:
+        rec.consignor = rec.supplier_name
+    if rec.recipient_name and not rec.consignee:
+        rec.consignee = rec.recipient_name
+    if rec.dispatch_place and not rec.source:
+        rec.source = rec.dispatch_place
+    if rec.delivery_place and not rec.destination:
+        rec.destination = rec.delivery_place
+
+    if rec.mime_type == "application/pdf" or rec.pdf_base64:
+        rec.source_type = "pdf"
+        if rec.document_type in ("", "lr_receipt"):
+            rec.document_type = "pdf"
+    elif rec.eway_bill_no:
+        rec.document_type = "eway_bill"
+
+    now = _iso_now()
+    rec.year = now.year
+    rec.month = now.month
+    rec.week = now.isocalendar().week
+    rec.processed_at = now.isoformat()
+    rec.ocr_confidence = calculate_confidence(rec.confidence_scores)
+    rec.review_required = rec.ocr_confidence < 0.80 if rec.ocr_confidence <= 1 else rec.ocr_confidence < 80
+
+    counter = await db.counters.find_one_and_update(
+        {"_id": "records_serial"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not counter or int(counter.get("seq", 0) or 0) <= 0:
+        last = await db.records.find_one({}, {"_id": 0, "serial_no": 1}, sort=[("serial_no", -1)])
+        base = int((last or {}).get("serial_no") or 0)
+        counter = await db.counters.find_one_and_update(
+            {"_id": "records_serial"},
+            {"$set": {"seq": base + 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+
+    rec.serial_no = int(counter["seq"])
+    existing_max = await db.records.find_one({}, {"_id": 0, "serial_no": 1}, sort=[("serial_no", -1)])
+    exmax = int((existing_max or {}).get("serial_no") or 0)
+    if rec.serial_no <= exmax:
+        counter = await db.counters.find_one_and_update(
+            {"_id": "records_serial"},
+            {"$set": {"seq": exmax + 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        rec.serial_no = int(counter["seq"])
+
+    doc = _model_dump(rec)
+    await db.records.insert_one(doc)
+    doc.pop("_id", None)
+    return rec
+
+
+@api.get("/records")
+async def list_records(
+    q: Optional[str] = None,
+    folder_id: Optional[str] = None,
+    favorites: Optional[bool] = None,
+    document_type: Optional[str] = None,
+    scope: Optional[str] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    week: Optional[int] = None,
+    limit: int = 200,
+):
+    if scope == "trash":
+        query: Dict[str, Any] = {"is_deleted": True}
+    else:
+        query = {"is_deleted": {"$ne": True}}
+
+    if folder_id:
+        query["folder_id"] = folder_id
+    if favorites:
+        query["is_favorite"] = True
+    if document_type:
+        if document_type == "pdf":
+            query["source_type"] = "pdf"
+        else:
+            query["document_type"] = document_type
+
+    if scope and scope != "trash":
+        query.update(_scope_query(scope, year, month, week))
+    else:
+        query.update(_scope_query(None, year, month, week))
+
+    if q:
+        rx = {"$regex": re.escape(q), "$options": "i"}
+        query["$or"] = [
+            {"eway_bill_no": rx}, {"lr_number": rx}, {"vehicle_number": rx},
+            {"supplier_gstin": rx}, {"supplier_name": rx}, {"dispatch_place": rx},
+            {"recipient_gstin": rx}, {"recipient_name": rx}, {"delivery_place": rx},
+            {"amount": rx}, {"date": rx},
+            {"document_number": rx}, {"gstin": rx}, {"transporter": rx}, {"transporter_name": rx},
+            {"consignor": rx}, {"consignee": rx}, {"source": rx}, {"destination": rx},
+            {"remarks": rx}, {"raw_text": rx}, {"file_name": rx},
+        ]
+
+    cursor = db.records.find(
+        query,
+        {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
+    ).sort("created_at", -1).limit(limit)
+    items = await cursor.to_list(limit)
+    return {"items": items, "count": len(items)}
+
+
+@api.get("/records/trash")
+async def list_deleted_records(limit: int = 200):
+    items = await db.records.find(
+        {"is_deleted": True},
+        {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
+    ).sort("deleted_at", -1).limit(limit).to_list(limit)
+    return {"items": items, "count": len(items)}
+
+
+@api.get("/records/{record_id}")
+async def get_record(record_id: str):
+    rec = await db.records.find_one({"id": record_id}, {"_id": 0})
+    if not rec:
+        raise HTTPException(404, "Record not found")
+    return rec
+
+
+@api.patch("/records/{record_id}")
+async def update_record(record_id: str, patch: RecordUpdate):
+    updates = {k: v for k, v in _model_dump(patch).items() if v is not None}
+    if not updates:
+        rec = await db.records.find_one({"id": record_id}, {"_id": 0})
+        if not rec:
+            raise HTTPException(404, "Record not found")
+        return rec
+
+    if updates.get("eway_bill_no") and not updates.get("document_number"):
+        updates["document_number"] = updates["eway_bill_no"]
+    if updates.get("lr_number") and not updates.get("document_number"):
+        updates["document_number"] = updates["lr_number"]
+    if updates.get("supplier_gstin") and not updates.get("gstin"):
+        updates["gstin"] = updates["supplier_gstin"]
+    if updates.get("supplier_name") and not updates.get("consignor"):
+        updates["consignor"] = updates["supplier_name"]
+    if updates.get("recipient_name") and not updates.get("consignee"):
+        updates["consignee"] = updates["recipient_name"]
+    if updates.get("dispatch_place") and not updates.get("source"):
+        updates["source"] = updates["dispatch_place"]
+    if updates.get("delivery_place") and not updates.get("destination"):
+        updates["destination"] = updates["delivery_place"]
+    if updates.get("mime_type") == "application/pdf" or updates.get("pdf_base64"):
+        updates["source_type"] = "pdf"
+
+    updates["updated_at"] = _now_iso()
+    res = await db.records.update_one({"id": record_id}, {"$set": updates})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Record not found")
+    rec = await db.records.find_one({"id": record_id}, {"_id": 0})
+    return rec
+
+
+@api.delete("/records/{record_id}")
+async def delete_record(record_id: str):
+    res = await db.records.update_one(
+        {"id": record_id},
+        {"$set": {"is_deleted": True, "deleted_at": _now_iso(), "updated_at": _now_iso()}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(404, "Record not found")
+    return {"ok": True, "success": True}
+
+
+@api.post("/records/{record_id}/restore")
+async def restore_record(record_id: str):
+    res = await db.records.update_one(
+        {"id": record_id},
+        {"$set": {"is_deleted": False, "deleted_at": "", "updated_at": _now_iso()}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(404, "Record not found")
+    return {"ok": True, "success": True}
+
+
+@api.delete("/records/{record_id}/forever")
+async def delete_record_forever(record_id: str):
+    res = await db.records.delete_one({"id": record_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Record not found")
+    return {"ok": True, "success": True}
+
+
+@api.post("/records/duplicates")
+async def check_duplicates(payload: DuplicateRequest):
+    data = _model_dump(payload)
+    ors: List[Dict[str, Any]] = []
+
+    ewb = (data.get("eway_bill_no") or "").strip()
+    doc_no = (data.get("document_number") or data.get("lr_number") or "").strip()
+
+    if ewb:
+        ors.append({"eway_bill_no": ewb})
+        ors.append({"document_number": ewb})
+    if doc_no:
+        ors.append({"lr_number": doc_no})
+        ors.append({"document_number": doc_no})
+
+    for key in ("vehicle_number", "supplier_gstin", "recipient_gstin", "gstin", "image_hash"):
+        val = (data.get(key) or "").strip()
+        if val:
+            ors.append({key: val})
+
+    amt = (data.get("amount") or "").strip()
+    dt = (data.get("date") or "").strip()
+    if amt and dt:
+        ors.append({"$and": [{"amount": amt}, {"date": dt}]})
+
+    if not ors:
+        return {"duplicates": []}
+
+    q: Dict[str, Any] = {"is_deleted": {"$ne": True}, "$or": ors}
+    if data.get("exclude_id"):
+        q["id"] = {"$ne": data["exclude_id"]}
+
+    dups = await db.records.find(
+        q,
+        {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
+    ).limit(20).to_list(20)
+    return {"duplicates": dups}
+
+
+@api.post("/records/{record_id}/move")
+async def move_record(record_id: str, payload: Dict[str, Any]):
+    folder_id = payload.get("folder_id")
+    res = await db.records.update_one(
+        {"id": record_id},
+        {"$set": {"folder_id": folder_id, "updated_at": _now_iso()}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(404, "Record not found")
+    return {"ok": True, "folder_id": folder_id}
+
+
+# ----- Folders -----
+@api.post("/folders", response_model=Folder)
+async def create_folder(payload: FolderCreate):
+    folder = Folder(**_model_dump(payload))
+    await db.folders.insert_one(_model_dump(folder))
+    return folder
+
+
+@api.get("/folders")
+async def list_folders():
+    folders = await db.folders.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    for f in folders:
+        f["record_count"] = await db.records.count_documents({"folder_id": f["id"], "is_deleted": {"$ne": True}})
+    return {"items": folders}
+
+
 @api.get("/folders/smart")
 async def smart_folders():
-    """Auto-organized folders + year/month breakdown of all records."""
-    all_count = await db.records.count_documents({})
+    active_q = {"is_deleted": {"$ne": True}}
+    all_count = await db.records.count_documents(active_q)
     smart = []
     for key, label in [("today", "Today"), ("week", "This Week"), ("month", "This Month"), ("year", "This Year")]:
-        q = _scope_query(key, None, None, None)
+        q = {**active_q, **_scope_query(key, None, None, None)}
         smart.append({"key": key, "label": label, "count": await db.records.count_documents(q)})
-    smart.append({"key": "all", "label": "All Records", "count": all_count})
 
-    # Year -> Month breakdown from created_at ISO strings
+    smart.extend([
+        {"key": "all", "label": "All Records", "count": all_count},
+        {"key": "pdf", "label": "PDF Records", "count": await db.records.count_documents({**active_q, "source_type": "pdf"})},
+        {"key": "eway", "label": "E-Way Bills", "count": await db.records.count_documents({**active_q, "document_type": "eway_bill"})},
+        {"key": "trash", "label": "Recently Deleted", "count": await db.records.count_documents({"is_deleted": True})},
+    ])
+
     pipeline = [
-        {"$match": {"created_at": {"$exists": True, "$ne": ""}}},
+        {"$match": active_q},
         {"$project": {
             "year": {"$substrBytes": ["$created_at", 0, 4]},
             "month": {"$substrBytes": ["$created_at", 5, 2]},
@@ -595,7 +860,7 @@ async def smart_folders():
 @api.delete("/folders/{folder_id}")
 async def delete_folder(folder_id: str):
     await db.folders.delete_one({"id": folder_id})
-    await db.records.update_many({"folder_id": folder_id}, {"$set": {"folder_id": None}})
+    await db.records.update_many({"folder_id": folder_id}, {"$set": {"folder_id": None, "updated_at": _now_iso()}})
     return {"ok": True}
 
 
@@ -603,6 +868,7 @@ async def delete_folder(folder_id: str):
 CORE_COLUMNS = [
     ("serial_no", "Sr No."),
     ("date", "Date"),
+    ("eway_bill_no", "E-Way Bill No"),
     ("lr_number", "LR Number"),
     ("vehicle_number", "Vehicle Number"),
     ("supplier_gstin", "Supplier GSTIN"),
@@ -620,23 +886,25 @@ def _core_row(r: Dict[str, Any], idx: int) -> List[str]:
     for key, _ in CORE_COLUMNS:
         if key == "serial_no":
             row.append(str(r.get("serial_no") or idx))
-        else:
-            # Fallbacks for older records
-            v = r.get(key) or ""
-            if not v:
-                if key == "lr_number":
-                    v = r.get("document_number") or ""
-                elif key == "supplier_gstin":
-                    v = r.get("gstin") or ""
-                elif key == "supplier_name":
-                    v = r.get("consignor") or r.get("transporter_name") or ""
-                elif key == "dispatch_place":
-                    v = r.get("source") or r.get("origin_city") or ""
-                elif key == "recipient_name":
-                    v = r.get("consignee") or ""
-                elif key == "delivery_place":
-                    v = r.get("destination") or r.get("destination_city") or ""
-            row.append(str(v))
+            continue
+
+        v = r.get(key) or ""
+        if not v:
+            if key == "eway_bill_no":
+                v = r.get("eway_bill_no") or r.get("document_number") or ""
+            elif key == "lr_number":
+                v = r.get("lr_number") or r.get("document_number") or ""
+            elif key == "supplier_gstin":
+                v = r.get("supplier_gstin") or r.get("gstin") or ""
+            elif key == "supplier_name":
+                v = r.get("supplier_name") or r.get("consignor") or r.get("transporter_name") or ""
+            elif key == "dispatch_place":
+                v = r.get("dispatch_place") or r.get("source") or r.get("origin_city") or ""
+            elif key == "recipient_name":
+                v = r.get("recipient_name") or r.get("consignee") or ""
+            elif key == "delivery_place":
+                v = r.get("delivery_place") or r.get("destination") or r.get("destination_city") or ""
+        row.append(str(v))
     return row
 
 
@@ -663,28 +931,32 @@ def _build_xlsx(records: List[Dict[str, Any]]) -> bytes:
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     wb = Workbook()
     ws = wb.active
-    ws.title = "DRCDocs"
+    ws.title = "SVL Docs"
+
     labels = [label for _, label in CORE_COLUMNS]
     ws.append(labels)
+
     header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill(start_color="1A1D24", end_color="1A1D24", fill_type="solid")
-    thin = Side(border_style="thin", color="CCCCCC")
+    header_fill = PatternFill(start_color="0A57D8", end_color="0A57D8", fill_type="solid")
+    thin = Side(border_style="thin", color="BBD7FF")
     border = Border(top=thin, left=thin, right=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
     for cell in ws[1]:
         cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = center
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = border
+
     for idx, r in enumerate(records, start=1):
-        row = _core_row(r, idx)
-        ws.append(row)
+        ws.append(_core_row(r, idx))
         for cell in ws[ws.max_row]:
             cell.border = border
             cell.alignment = Alignment(vertical="center", wrap_text=True)
-    widths = [8, 14, 18, 18, 22, 26, 22, 22, 26, 22, 14]
+
+    widths = [8, 14, 20, 18, 18, 22, 26, 22, 22, 26, 22, 14]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+
     ws.freeze_panes = "A2"
     bio = io.BytesIO()
     wb.save(bio)
@@ -692,92 +964,93 @@ def _build_xlsx(records: List[Dict[str, Any]]) -> bytes:
 
 
 def _build_pdf(records: List[Dict[str, Any]]) -> bytes:
-    """Render records in the same tabular layout as the Excel sheet."""
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.units import mm
+
     bio = io.BytesIO()
     doc = SimpleDocTemplate(
         bio, pagesize=landscape(A4),
-        leftMargin=10 * mm, rightMargin=10 * mm,
-        topMargin=12 * mm, bottomMargin=12 * mm,
+        leftMargin=8 * mm, rightMargin=8 * mm,
+        topMargin=10 * mm, bottomMargin=10 * mm,
     )
+
     styles = getSampleStyleSheet()
     story = [
-        Paragraph("<b>DRCDocs Enterprise — Records Ledger</b>", styles["Title"]),
+        Paragraph("<b>SVL Docs Scanner — Records Ledger</b>", styles["Title"]),
         Paragraph(f"Generated: {datetime.now().strftime('%d %b %Y, %H:%M')}  |  Total: {len(records)}", styles["Normal"]),
         Spacer(1, 6),
     ]
-    headers = [label for _, label in CORE_COLUMNS]
-    data = [headers]
+
+    data = [[label for _, label in CORE_COLUMNS]]
     for idx, r in enumerate(records, start=1):
         data.append(_core_row(r, idx))
-    col_widths = [14, 22, 30, 30, 36, 42, 36, 36, 42, 36, 24]
-    col_widths = [w * mm for w in col_widths]
-    tbl = Table(data, colWidths=col_widths, repeatRows=1)
+
+    col_widths = [12, 20, 30, 26, 28, 34, 38, 32, 34, 38, 32, 22]
+    tbl = Table(data, colWidths=[w * mm for w in col_widths], repeatRows=1)
     tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1A1D24")),
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0A57D8")),
         ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
         ("ALIGN", (0, 0), (-1, 0), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.whitesmoke, rl_colors.white]),
-        ("GRID", (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#CCCCCC")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.HexColor("#F4F8FF"), rl_colors.white]),
+        ("GRID", (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#BBD7FF")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
         ("TOPPADDING", (0, 0), (-1, -1), 4),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
     story.append(tbl)
+
     if not records:
         story.append(Paragraph("<i>No records to export.</i>", styles["Normal"]))
+
     doc.build(story)
     return bio.getvalue()
 
 
 @api.post("/export")
 async def export_records(req: ExportRequest):
-    query: Dict[str, Any] = {}
+    query: Dict[str, Any] = {"is_deleted": {"$ne": True}}
+
     if req.record_ids:
         query["id"] = {"$in": req.record_ids}
     else:
         if req.folder_id:
             query["folder_id"] = req.folder_id
-        scope_q = _scope_query(req.scope, req.year, req.month, req.week)
-        query.update(scope_q)
+        if req.document_type:
+            if req.document_type == "pdf":
+                query["source_type"] = "pdf"
+            else:
+                query["document_type"] = req.document_type
+        query.update(_scope_query(req.scope, req.year, req.month, req.week))
+
     records = await db.records.find(
         query,
         {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
     ).sort("serial_no", 1).to_list(5000)
+
     fmt = (req.format or "csv").lower()
     if fmt == "csv":
-        data = _build_csv(records)
-        mime = "text/csv"
-        ext = "csv"
+        data, mime, ext = _build_csv(records), "text/csv", "csv"
     elif fmt == "json":
-        data = json.dumps(records, indent=2, default=str).encode("utf-8")
-        mime = "application/json"
-        ext = "json"
+        data, mime, ext = json.dumps(records, indent=2, default=str).encode("utf-8"), "application/json", "json"
     elif fmt == "txt":
-        data = _build_txt(records)
-        mime = "text/plain"
-        ext = "txt"
+        data, mime, ext = _build_txt(records), "text/plain", "txt"
     elif fmt == "xlsx":
-        data = _build_xlsx(records)
-        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ext = "xlsx"
+        data, mime, ext = _build_xlsx(records), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
     elif fmt == "pdf":
-        data = _build_pdf(records)
-        mime = "application/pdf"
-        ext = "pdf"
+        data, mime, ext = _build_pdf(records), "application/pdf", "pdf"
     else:
         raise HTTPException(400, "invalid format")
+
     b64 = base64.b64encode(data).decode("utf-8")
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return {"filename": f"drcdocs-{ts}.{ext}", "mime_type": mime, "base64": b64, "count": len(records)}
+    return {"filename": f"svl-docs-{ts}.{ext}", "mime_type": mime, "base64": b64, "count": len(records)}
 
 
 app.include_router(api)

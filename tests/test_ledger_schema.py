@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 
 BASE_URL = os.environ.get(
     "EXPO_PUBLIC_BACKEND_URL",
-    "https://logistics-ocr-pro-1.preview.emergentagent.com",
+    "https://drcdocs-backend.onrender.com",
 ).rstrip("/")
 
 
