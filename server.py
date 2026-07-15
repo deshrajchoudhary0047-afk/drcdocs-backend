@@ -30,7 +30,7 @@ if not MONGO_URL:
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-app = FastAPI(title="SVL Docs Scanner API", version="2.0.0")
+app = FastAPI(title="SVL Docs Scanner API", version="2.2.0")
 api = APIRouter(prefix="/api")
 
 
@@ -54,6 +54,19 @@ class PDFOCRRequest(BaseModel):
     detect_only_eway: bool = True
 
 
+class BatchOCRItem(BaseModel):
+    image_base64: str
+    mime_type: str = "image/jpeg"
+    file_name: str = ""
+
+
+class BatchOCRRequest(BaseModel):
+    items: List[BatchOCRItem] = Field(default_factory=list)
+    detect_only_eway: bool = True
+    auto_crop: bool = True
+    ai_enhance: bool = True
+
+
 class OCRField(BaseModel):
     value: str = ""
     confidence: float = 0.0
@@ -63,11 +76,11 @@ class OCRResult(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     document_type: str = "unknown"
     raw_text: str = ""
-    fields: Dict[str, OCRField] = {}
+    fields: Dict[str, OCRField] = Field(default_factory=dict)
     overall_confidence: float = 0.0
     page_count: int = 0
     detected_pages: int = 0
-    pages: List[Dict[str, Any]] = []
+    pages: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class RecordCreate(BaseModel):
@@ -92,7 +105,7 @@ class RecordCreate(BaseModel):
     page_count: int = 0
     detected_pages: int = 0
     selected_page: int = 0
-    pages: List[Dict[str, Any]] = []
+    pages: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Recently Deleted
     is_deleted: bool = False
@@ -125,9 +138,9 @@ class RecordCreate(BaseModel):
     processed_image_base64: str = ""
     pdf_base64: str = ""
     image_hash: str = ""
-    file_paths: Dict[str, str] = {}
+    file_paths: Dict[str, str] = Field(default_factory=dict)
     folder_id: Optional[str] = None
-    confidence_scores: Dict[str, float] = {}
+    confidence_scores: Dict[str, float] = Field(default_factory=dict)
     is_favorite: bool = False
 
 
@@ -139,7 +152,7 @@ class Record(RecordCreate):
     year: int = 0
     month: int = 0
     week: int = 0
-    ocr_version: str = "SVL AI Engine 2.0"
+    ocr_version: str = "SVL AI Engine 2.2"
     ocr_confidence: float = 0.0
     processed_at: str = ""
     status: str = "verified"
@@ -236,6 +249,22 @@ class DuplicateRequest(BaseModel):
     date: Optional[str] = ""
     image_hash: Optional[str] = ""
     exclude_id: Optional[str] = None
+
+
+class ManualRecordRequest(BaseModel):
+    date: str = ""
+    lr_number: str = ""
+    vehicle_number: str = ""
+    supplier_gstin: str = ""
+    supplier_name: str = ""
+    dispatch_place: str = ""
+    recipient_gstin: str = ""
+    recipient_name: str = ""
+    delivery_place: str = ""
+    amount: str = ""
+    transporter: str = ""
+    remarks: str = ""
+    folder_id: Optional[str] = None
 
 
 # =========================
@@ -371,16 +400,28 @@ def _normalize_fields(fields: Any) -> Dict[str, Dict[str, Any]]:
 def calculate_confidence(fields: Dict[str, Any]) -> float:
     if not fields:
         return 0.0
-    scores = []
+
+    scores: List[float] = []
+
     for value in fields.values():
-        if isinstance(value, dict) and value.get("value"):
-            try:
-                scores.append(float(value.get("confidence", 0.0) or 0.0))
-            except Exception:
-                pass
+        try:
+            if isinstance(value, dict):
+                if value.get("value"):
+                    scores.append(float(value.get("confidence", 0.0) or 0.0))
+            elif isinstance(value, (int, float)):
+                scores.append(float(value))
+        except Exception:
+            continue
+
     if not scores:
         return 0.0
-    return round(sum(scores) / len(scores), 4)
+
+    normalized = [
+        max(0.0, min(1.0, score / 100 if score > 1 else score))
+        for score in scores
+    ]
+    return round(sum(normalized) / len(normalized), 4)
+
 
 
 async def run_ocr(image_b64: str, mime_type: str) -> Dict[str, Any]:
@@ -490,12 +531,69 @@ def _scope_query(scope: Optional[str], year: Optional[int], month: Optional[int]
     return {}
 
 
+def _clean_upper(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).upper().strip()
+
+
+def _clean_amount(value: str) -> str:
+    cleaned = re.sub(r"[^0-9.]", "", str(value or ""))
+    if cleaned.count(".") > 1:
+        first, *rest = cleaned.split(".")
+        cleaned = first + "." + "".join(rest)
+    return cleaned
+
+
+async def _next_serial_no() -> int:
+    counter = await db.counters.find_one_and_update(
+        {"_id": "records_serial"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    seq = int((counter or {}).get("seq", 0) or 0)
+    if seq > 0:
+        return seq
+
+    last = await db.records.find_one(
+        {},
+        {"_id": 0, "serial_no": 1},
+        sort=[("serial_no", -1)],
+    )
+    base = int((last or {}).get("serial_no") or 0)
+
+    counter = await db.counters.find_one_and_update(
+        {"_id": "records_serial"},
+        {"$set": {"seq": base + 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(counter["seq"])
+
+
 # =========================
 # Routes
 # =========================
 @api.get("/")
 async def root():
-    return {"message": "SVL Docs Scanner API", "version": "2.0.0"}
+    return {"message": "SVL Docs Scanner API", "version": "2.2.0"}
+
+
+@api.get("/health")
+async def health():
+    try:
+        await db.command("ping")
+        return {
+            "ok": True,
+            "version": "2.2.0",
+            "database": "connected",
+            "gemini_configured": bool(GEMINI_API_KEY),
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database unavailable: {exc}",
+        )
 
 
 @api.get("/stats")
@@ -505,7 +603,12 @@ async def stats():
     favorites = await db.records.count_documents({**active_q, "is_favorite": True})
     folders = await db.folders.count_documents({})
     pdf_records = await db.records.count_documents({**active_q, "source_type": "pdf"})
-    image_records = await db.records.count_documents({**active_q, "source_type": {"$ne": "pdf"}})
+    image_records = await db.records.count_documents(
+        {**active_q, "source_type": {"$nin": ["pdf", "manual"]}}
+    )
+    manual_records = await db.records.count_documents(
+        {**active_q, "source_type": "manual"}
+    )
     trash_records = await db.records.count_documents({"is_deleted": True})
 
     recent = await db.records.find(
@@ -528,6 +631,7 @@ async def stats():
         "folders": folders,
         "pdf_records": pdf_records,
         "image_records": image_records,
+        "manual_records": manual_records,
         "trash_records": trash_records,
         "by_type": by_type,
         "recent": recent,
@@ -551,6 +655,42 @@ async def scan_pdf(req: PDFOCRRequest):
     return JSONResponse(status_code=200, content=result)
 
 
+@api.post("/ocr/batch")
+async def scan_batch(req: BatchOCRRequest):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="items required")
+
+    results: List[Dict[str, Any]] = []
+    for index, item in enumerate(req.items, start=1):
+        try:
+            result = await run_ocr(item.image_base64, item.mime_type)
+            result["index"] = index
+            result["file_name"] = item.file_name
+            results.append(result)
+        except HTTPException as exc:
+            results.append({
+                "index": index,
+                "file_name": item.file_name,
+                "document_type": "unknown",
+                "raw_text": "",
+                "fields": _normalize_fields({}),
+                "overall_confidence": 0.0,
+                "error": str(exc.detail),
+            })
+
+    if req.detect_only_eway:
+        results = [
+            item for item in results
+            if str(item.get("document_type", "")).lower() == "eway_bill"
+        ]
+
+    return {
+        "items": results,
+        "count": len(results),
+        "processed": len(req.items),
+    }
+
+
 @api.post("/records", response_model=Record)
 async def create_record(payload: RecordCreate):
     payload_data = _model_dump(payload)
@@ -572,10 +712,18 @@ async def create_record(payload: RecordCreate):
     if rec.delivery_place and not rec.destination:
         rec.destination = rec.delivery_place
 
-    if rec.mime_type == "application/pdf" or rec.pdf_base64:
+    if rec.source_type == "manual" or rec.mime_type == "text/manual":
+        rec.source_type = "manual"
+        rec.mime_type = "text/manual"
+        rec.document_type = "manual_entry"
+        rec.verification_status = "verified"
+        rec.status = "verified"
+        rec.review_required = False
+        rec.ocr_confidence = 1.0
+    elif rec.mime_type == "application/pdf" or rec.pdf_base64:
         rec.source_type = "pdf"
-        if rec.document_type in ("", "lr_receipt"):
-            rec.document_type = "pdf"
+        if rec.document_type in ("", "lr_receipt", "pdf"):
+            rec.document_type = "eway_bill" if rec.eway_bill_no or rec.detected_pages else "pdf"
     elif rec.eway_bill_no:
         rec.document_type = "eway_bill"
 
@@ -584,36 +732,78 @@ async def create_record(payload: RecordCreate):
     rec.month = now.month
     rec.week = now.isocalendar().week
     rec.processed_at = now.isoformat()
-    rec.ocr_confidence = calculate_confidence(rec.confidence_scores)
-    rec.review_required = rec.ocr_confidence < 0.80 if rec.ocr_confidence <= 1 else rec.ocr_confidence < 80
+    if rec.source_type == "manual":
+        rec.ocr_confidence = 1.0
+        rec.review_required = False
+    else:
+        rec.ocr_confidence = calculate_confidence(rec.confidence_scores)
+        rec.review_required = (
+            rec.ocr_confidence < 0.80
+            if rec.ocr_confidence <= 1
+            else rec.ocr_confidence < 80
+        )
 
-    counter = await db.counters.find_one_and_update(
-        {"_id": "records_serial"},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
+    rec.serial_no = await _next_serial_no()
+
+    doc = _model_dump(rec)
+    await db.records.insert_one(doc)
+    doc.pop("_id", None)
+    return rec
+
+
+@api.post("/records/manual", response_model=Record)
+async def create_manual_record(payload: ManualRecordRequest):
+    data = _model_dump(payload)
+
+    if not (
+        str(data.get("lr_number") or "").strip()
+        or str(data.get("vehicle_number") or "").strip()
+        or str(data.get("supplier_name") or "").strip()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="LR Number, Vehicle Number, or Supplier Name is required",
+        )
+
+    now = _iso_now()
+
+    rec = Record(
+        date=str(data.get("date") or "").strip(),
+        lr_number=str(data.get("lr_number") or "").strip(),
+        vehicle_number=_clean_upper(data.get("vehicle_number") or ""),
+        supplier_gstin=_clean_upper(data.get("supplier_gstin") or "")[:15],
+        supplier_name=str(data.get("supplier_name") or "").strip(),
+        dispatch_place=str(data.get("dispatch_place") or "").strip(),
+        recipient_gstin=_clean_upper(data.get("recipient_gstin") or "")[:15],
+        recipient_name=str(data.get("recipient_name") or "").strip(),
+        delivery_place=str(data.get("delivery_place") or "").strip(),
+        amount=_clean_amount(data.get("amount") or ""),
+        transporter=str(data.get("transporter") or "").strip(),
+        transporter_name=str(data.get("transporter") or "").strip(),
+        remarks=str(data.get("remarks") or "").strip(),
+        folder_id=data.get("folder_id"),
+        document_type="manual_entry",
+        document_number=str(data.get("lr_number") or "").strip(),
+        gstin=_clean_upper(data.get("supplier_gstin") or "")[:15],
+        consignor=str(data.get("supplier_name") or "").strip(),
+        consignee=str(data.get("recipient_name") or "").strip(),
+        source=str(data.get("dispatch_place") or "").strip(),
+        destination=str(data.get("delivery_place") or "").strip(),
+        source_type="manual",
+        mime_type="text/manual",
+        verification_status="verified",
+        status="verified",
+        review_required=False,
+        ocr_confidence=1.0,
+        processed_at=now.isoformat(),
+        year=now.year,
+        month=now.month,
+        week=now.isocalendar().week,
+        ocr_version="SVL Manual Entry 2.2",
+        confidence_scores={},
     )
 
-    if not counter or int(counter.get("seq", 0) or 0) <= 0:
-        last = await db.records.find_one({}, {"_id": 0, "serial_no": 1}, sort=[("serial_no", -1)])
-        base = int((last or {}).get("serial_no") or 0)
-        counter = await db.counters.find_one_and_update(
-            {"_id": "records_serial"},
-            {"$set": {"seq": base + 1}},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-
-    rec.serial_no = int(counter["seq"])
-    existing_max = await db.records.find_one({}, {"_id": 0, "serial_no": 1}, sort=[("serial_no", -1)])
-    exmax = int((existing_max or {}).get("serial_no") or 0)
-    if rec.serial_no <= exmax:
-        counter = await db.counters.find_one_and_update(
-            {"_id": "records_serial"},
-            {"$set": {"seq": exmax + 1}},
-            return_document=ReturnDocument.AFTER,
-        )
-        rec.serial_no = int(counter["seq"])
+    rec.serial_no = await _next_serial_no()
 
     doc = _model_dump(rec)
     await db.records.insert_one(doc)
@@ -645,6 +835,8 @@ async def list_records(
     if document_type:
         if document_type == "pdf":
             query["source_type"] = "pdf"
+        elif document_type in ("manual", "manual_entry"):
+            query["source_type"] = "manual"
         else:
             query["document_type"] = document_type
 
@@ -680,6 +872,12 @@ async def list_deleted_records(limit: int = 200):
         {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
     ).sort("deleted_at", -1).limit(limit).to_list(limit)
     return {"items": items, "count": len(items)}
+
+
+@api.delete("/records/trash")
+async def empty_trash():
+    result = await db.records.delete_many({"is_deleted": True})
+    return {"ok": True, "success": True, "deleted_count": result.deleted_count}
 
 
 @api.get("/records/{record_id}")
@@ -752,6 +950,11 @@ async def delete_record_forever(record_id: str):
     if res.deleted_count == 0:
         raise HTTPException(404, "Record not found")
     return {"ok": True, "success": True}
+
+
+@api.delete("/records/{record_id}/permanent")
+async def delete_record_permanent(record_id: str):
+    return await delete_record_forever(record_id)
 
 
 @api.post("/records/duplicates")
@@ -834,6 +1037,7 @@ async def smart_folders():
         {"key": "all", "label": "All Records", "count": all_count},
         {"key": "pdf", "label": "PDF Records", "count": await db.records.count_documents({**active_q, "source_type": "pdf"})},
         {"key": "eway", "label": "E-Way Bills", "count": await db.records.count_documents({**active_q, "document_type": "eway_bill"})},
+        {"key": "manual", "label": "Manual Entries", "count": await db.records.count_documents({**active_q, "source_type": "manual"})},
         {"key": "trash", "label": "Recently Deleted", "count": await db.records.count_documents({"is_deleted": True})},
     ])
 
@@ -842,17 +1046,38 @@ async def smart_folders():
         {"$project": {
             "year": {"$substrBytes": ["$created_at", 0, 4]},
             "month": {"$substrBytes": ["$created_at", 5, 2]},
+            "week": {"$ifNull": ["$week", 0]},
         }},
-        {"$group": {"_id": {"year": "$year", "month": "$month"}, "count": {"$sum": 1}}},
-        {"$sort": {"_id.year": -1, "_id.month": -1}},
+        {"$group": {
+            "_id": {"year": "$year", "month": "$month", "week": "$week"},
+            "count": {"$sum": 1},
+        }},
+        {"$sort": {"_id.year": -1, "_id.month": -1, "_id.week": -1}},
     ]
     year_map: Dict[str, Dict[str, Any]] = {}
     async for row in db.records.aggregate(pipeline):
         y = row["_id"]["year"]
         m = row["_id"]["month"]
-        year_map.setdefault(y, {"year": y, "total": 0, "months": []})
-        year_map[y]["months"].append({"month": m, "count": row["count"]})
-        year_map[y]["total"] += row["count"]
+        w = int(row["_id"].get("week") or 0)
+        count = int(row["count"])
+
+        year_entry = year_map.setdefault(
+            y,
+            {"year": y, "total": 0, "months": []},
+        )
+
+        month_entry = next(
+            (item for item in year_entry["months"] if item["month"] == m),
+            None,
+        )
+        if month_entry is None:
+            month_entry = {"month": m, "count": 0, "weeks": []}
+            year_entry["months"].append(month_entry)
+
+        month_entry["count"] += count
+        if w:
+            month_entry["weeks"].append({"week": str(w), "count": count})
+        year_entry["total"] += count
 
     return {"smart": smart, "years": list(year_map.values())}
 
@@ -868,7 +1093,6 @@ async def delete_folder(folder_id: str):
 CORE_COLUMNS = [
     ("serial_no", "Sr No."),
     ("date", "Date"),
-    ("eway_bill_no", "E-Way Bill No"),
     ("lr_number", "LR Number"),
     ("vehicle_number", "Vehicle Number"),
     ("supplier_gstin", "Supplier GSTIN"),
@@ -885,14 +1109,12 @@ def _core_row(r: Dict[str, Any], idx: int) -> List[str]:
     row = []
     for key, _ in CORE_COLUMNS:
         if key == "serial_no":
-            row.append(str(r.get("serial_no") or idx))
+            row.append(str(idx))
             continue
 
         v = r.get(key) or ""
         if not v:
-            if key == "eway_bill_no":
-                v = r.get("eway_bill_no") or r.get("document_number") or ""
-            elif key == "lr_number":
+            if key == "lr_number":
                 v = r.get("lr_number") or r.get("document_number") or ""
             elif key == "supplier_gstin":
                 v = r.get("supplier_gstin") or r.get("gstin") or ""
@@ -953,7 +1175,7 @@ def _build_xlsx(records: List[Dict[str, Any]]) -> bytes:
             cell.border = border
             cell.alignment = Alignment(vertical="center", wrap_text=True)
 
-    widths = [8, 14, 20, 18, 18, 22, 26, 22, 22, 26, 22, 14]
+    widths = [8, 14, 18, 18, 22, 26, 22, 22, 26, 22, 14]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
 
@@ -988,7 +1210,7 @@ def _build_pdf(records: List[Dict[str, Any]]) -> bytes:
     for idx, r in enumerate(records, start=1):
         data.append(_core_row(r, idx))
 
-    col_widths = [12, 20, 30, 26, 28, 34, 38, 32, 34, 38, 32, 22]
+    col_widths = [12, 20, 26, 28, 34, 38, 32, 34, 38, 32, 22]
     tbl = Table(data, colWidths=[w * mm for w in col_widths], repeatRows=1)
     tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0A57D8")),
@@ -1025,6 +1247,8 @@ async def export_records(req: ExportRequest):
         if req.document_type:
             if req.document_type == "pdf":
                 query["source_type"] = "pdf"
+            elif req.document_type in ("manual", "manual_entry"):
+                query["source_type"] = "manual"
             else:
                 query["document_type"] = req.document_type
         query.update(_scope_query(req.scope, req.year, req.month, req.week))
@@ -1032,7 +1256,11 @@ async def export_records(req: ExportRequest):
     records = await db.records.find(
         query,
         {"_id": 0, "image_base64": 0, "original_image_base64": 0, "processed_image_base64": 0, "pdf_base64": 0},
-    ).sort("serial_no", 1).to_list(5000)
+    ).sort([
+        ("lr_number", 1),
+        ("document_number", 1),
+        ("created_at", 1),
+    ]).to_list(5000)
 
     fmt = (req.format or "csv").lower()
     if fmt == "csv":
